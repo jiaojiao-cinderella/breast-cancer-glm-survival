@@ -1,0 +1,1402 @@
+---
+title: "GLM For Breast Cancer Prediction "
+author: "Yajiao Liu"
+date: "2026-03-12"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+fontsize: 12pt
+mainfont: "Times New Roman"
+linestretch: 1
+geometry: "top=0.35in, bottom=1in, left=1in, right=1in"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,   
+                      warning = FALSE,
+                      message = FALSE)
+```
+# 1 Introduction
+
+Breast cancer remains one of the most common malignancies worldwide, with heterogeneous molecular profiles that influence treatment response and patient outcomes. The recent landmark study by Gupta[1]published in Nature Genetics identified APOBEC3 enzymes as major drivers of mutational processes that promote therapy resistance. This finding underscores the critical need to understand how different mutational signatures and genomic instability markers affect clinical outcomes across diverse breast cancer subtypes.
+
+While the mechanistic role of APOBEC3 in therapy resistance is now established,the relative predictive value of different genomic instability markers (mutation count, fraction genome altered, microsatellite instability) for survival outcomes across receptor subtypes needs systematic quantification.Therefore,the questions will be discussed in this report:How do genomic instability markers predict overall survival?
+
+# 2 Descriptive Analysis
+
+The dataset used in this study is the MSK-IMPACT breast cancer dataset, obtained from cBioPortal. It contains 3,879 tumour samples from 3,117 unique patients. The dataset includes 25 variables covering patient demographics, clinical characteristics, and genomic sequencing results. Key variables include overall survival status, sample type, mutation count, fraction genome altered, microsatellite instability type, cancer type,tumour purity, overall survival status, recorded as deceased or living. 
+
+
+```{r}
+# Load Data
+
+library(readr)
+library(dplyr)
+library(moments)
+library(car)
+library(ResourceSelection)
+library(pROC)
+library(knitr)
+library(kableExtra)
+```
+
+
+```{r}
+setwd("C:/Users/marin/Desktop/STA223/PROJECT")
+datacancer=read_tsv("breast_msk_2025_clinical_data.tsv")
+
+```
+
+
+```{r,include=FALSE}
+colnames(datacancer)
+
+summary(datacancer)
+```
+
+## 2.1 Selection Variables & Justification
+
+For the purpose of analyzing survival prediction, 9 variables were selected based on their established biological and clinical relevance to breast cancer survival. The outcome variable is overall survival status. Sample type was also retained as a binary variable indicating whether the tumour was metastatic or primary. Genomic instability markers — mutation count, fraction genome altered (FGA),MSI score and MSI type — were included as primary predictors, as tumour mutational burden and chromosomal instability have been consistently associated with survival outcomes in cancer[2][3]. Metastatic status was included as the  clinical predictor of prognosis, while cancer type and tumour purity were retained as confounders reflecting tumour biology and sample quality respectively [4].
+
+Although Overall Survival in months was available, the binary Overall Survival Status was used as the outcome to enable logistic regression modeling, which directly addresses the research question of identifying genomic predictors associated with mortality risk rather than time-to-event.
+
+Sex, race, and ethnicity were excluded as the dataset consists almost exclusively of female breast cancer patients, leaving insufficient variation in sex for meaningful analysis, while race and ethnicity categories had small and uneven cell counts that precluded reliable coefficient estimation.
+
+
+```{r}
+data_selected <- datacancer%>%
+  select(
+    # Outcomes
+    'Overall Survival Status',
+    'Sample Type',
+    
+    # Primary Predictors (Genomic markers)
+    
+    'Mutation Count',
+    'Fraction Genome Altered',
+    'MSI Score',
+    'MSI Type',
+    
+    # Important Confounders
+    'Cancer Type Detailed',
+    
+    # Quality Control
+    'Tumor Purity',
+  )
+```
+
+
+
+# 3 Data Cleaning
+
+## 3.1 Variable Categorize
+
+```{r,include=FALSE}
+# clean names
+colnames(data_selected)<-gsub(" ","_",colnames(data_selected))
+colnames(data_selected)<-gsub("\\(|\\)","",colnames(data_selected))
+colnames(data_selected) <- tolower(colnames(data_selected))
+colnames(data_selected)
+```
+
+```{r,include=FALSE}
+df <- data_selected
+
+df$tumor_purity <- as.numeric(df$tumor_purity)
+
+#  Create binary outcomes
+
+# Binary survival status
+df$survival_binary <- ifelse(grepl("DECEASED", df$overall_survival_status), 1, 0)
+
+
+# Binary metastasis indicator
+# Local Recurrence (n=11) and Unknown (n=6) are grouped with Primary
+# as non-metastatic (0) due to insufficient sample size for separate
+# categories. This is a conservative classification.
+df$is_metastatic <- ifelse(df$sample_type == "Metastasis", 1, 0)
+
+df
+
+```
+ The outcome variable is overall survival status, dichotomized as deceased (1) and living (0). and the variable sample_type was dichotomized into a binary indicator (is_metastatic: 1 = Metastasis, 0 = otherwise). Local Recurrence (n = 11) and Unknown (n = 6) were grouped with Primary as the non-metastatic reference category due to their negligible sample sizes. Local Recurrence cases were considered clinically closer to primary than metastatic disease, supporting this classification.
+ 
+Among breast cancer subtypes, Invasive Ductal Carcinoma was the most prevalent (n = 2,466, 63.6%), followed by Invasive Lobular Carcinoma (n = 437, 11.3%), Other subtypes (n = 968, 24.9%), and Mixed type (n = 8, 0.2%). This distribution is consistent with known epidemiological patterns, as Invasive Ductal Carcinoma is the most common form of breast cancer worldwide, accounting for approximately 70-80% of all diagnoses[5].
+
+
+```{r,include=FALSE}
+#Simplify cancer type (too many categories)
+
+df <- df %>%
+  mutate(cancer_type_simple = case_when(
+    grepl("Ductal", cancer_type_detailed) ~ "Invasive Ductal",
+    grepl("Lobular", cancer_type_detailed) ~ "Invasive Lobular",
+    grepl("Mixed", cancer_type_detailed) ~ "Mixed",
+    TRUE ~ "Other"
+  ))
+
+table(df$cancer_type_simple)
+
+```
+
+```{r,include=FALSE}
+dim(data_selected)
+```
+
+## 3.2 Miss Data
+
+```{r,include=FALSE}
+#  Missing data assessment
+
+# Table 1
+
+missing_summary <- data.frame(
+  Variable = names(df),
+  Missing_Count = sapply(df, function(x) sum(is.na(x))),
+  Missing_Percent = round(sapply(df, function(x) 100 * sum(is.na(x)) / length(x)), 2)
+) %>%
+  arrange(desc(Missing_Count))
+
+print(missing_summary)
+
+
+# Variables with >10% missing
+high_missing <- missing_summary$Variable[missing_summary$Missing_Percent > 10]
+
+
+```
+
+```{r,include=FALSE}
+# Missing data assessment
+missing_summary <- data.frame(
+  Variable = names(df),
+  Missing_Count = sapply(df, function(x) sum(is.na(x))),
+  Missing_Percent = round(sapply(df, function(x) 100 * sum(is.na(x)) / length(x)), 2)
+) %>%
+  arrange(desc(Missing_Count))
+
+rownames(missing_summary) <- NULL
+
+kable(missing_summary,
+      col.names = c("Variable", "Missing Count", "Missing (%)"),
+      align = c("l", "c", "c"),
+      caption = "Missing Data Assessment",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE,
+                latex_options = "hold_position") %>%
+  row_spec(which(missing_summary$Missing_Percent > 0),
+           background = "#fff3e0") %>%
+  footnote(general = "All variables have less than 3% missing data. Listwise deletion applied.",
+           threeparttable = TRUE)
+
+# Variables with >10% missing
+high_missing <- missing_summary$Variable[missing_summary$Missing_Percent > 10]
+```
+
+Missing data analysis revealed that all variables had less than 3% missing values, with mutation count having the highest proportion of missing data (2.45%), followed by MSI score (2.40%), MSI type (2.35%), tumour purity (2.17%), and fraction genome altered (0.98%). Overall survival status had minimal missing data (0.08%), while sample type, cancer type, and derived variables had no missing values. Given that missing data did not exceed 3% for any variable, listwise deletion was applied, which is considered acceptable under this threshold and is unlikely to introduce significant bias[6].The result can be seen in the Appendix A Table 6.
+
+## 3.3 Outlier
+
+```{r,include=FALSE}
+# Table 2
+# Function to detect outliers using IQR method
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 3 * IQR
+  upper <- Q3 + 3 * IQR
+  outliers <- x < lower | x > upper
+  return(sum(outliers, na.rm = TRUE))
+}
+
+continuous_vars <- c("mutation_count", 
+                     "msi_score",
+                     "fraction_genome_altered", 
+                     "tumor_purity")
+
+outlier_counts <- data.frame(
+  Variable = c("Mutation Count", 
+               "MSI Score",
+               "Fraction Genome Altered", 
+               "Tumor Purity"),
+  N_Outliers = sapply(df[continuous_vars], detect_outliers),
+  Percent = round(100 * sapply(df[continuous_vars], 
+                               detect_outliers) / nrow(df), 2)
+)
+
+rownames(outlier_counts) <- NULL
+
+kable(outlier_counts,
+      col.names = c("Variable", "N Outliers", "Percentage (%)"),
+      align = c("l", "c", "c"),
+      caption = "Table A2.Outlier Detection Using 3xIQR Method",  # ← changed × to x
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(which(outlier_counts$Percent > 0),
+           bold = TRUE, background = "#fff3e0")
+  
+```
+Outlier detection(Appendix A:Table 7) using the 3×IQR method revealed that mutation count had 118 outliers (3.04%), Msi score had 75 outlier(1.93%),while fraction genome altered and tumour purity had no outliers. These outliers were retained in the analysis as extreme mutation counts are biologically plausible in cancer genomics and removing them could result in loss of clinically important information. Sensitivity analyses will assess their influence on model estimates.
+
+# 4 Exploratory Data Analysis (EDA)
+
+## 4.1 Variable Distributions 
+
+```{r,include=TRUE}
+continuous_vars <- c("mutation_count", 
+                     "msi_score",
+                     "fraction_genome_altered", 
+                     "tumor_purity")
+ 
+skewness_check <- data.frame(
+  Variable = c("Mutation Count",
+               "MSI Score",
+               "Fraction Genome Altered",
+               "Tumor Purity"),
+  Skewness = round(sapply(df[continuous_vars], 
+                          function(x) skewness(x, na.rm = TRUE)), 4),
+  Interpretation = sapply(df[continuous_vars], function(x) {
+    s <- skewness(x, na.rm = TRUE)
+    if(abs(s) < 0.5) return("Symmetric")
+    else if(s > 0.5) return("Right-skewed")
+    else return("Left-skewed")
+  }),
+  Transformation = c("Log transformation applied",
+                     "Recategorized to MSI Type Combined",
+                     "No transformation needed",
+                     "No transformation needed")
+)
+ 
+rownames(skewness_check) <- NULL
+ 
+# Force table counter to start at 3
+knitr::opts_chunk$set(table.number = 3)
+ 
+kable(skewness_check,
+      col.names = c("Variable", "Skewness", 
+                    "Interpretation", "Action Taken"),
+      align = c("l", "c", "c", "l"),
+      caption = "Skewness Assessment and Transformation Decisions",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE,
+                latex_options = c("scale_down", "hold_position")) %>%
+  row_spec(c(1,2), bold = TRUE, background = "#fff3e0") %>%
+  footnote(general = "MSI Score recategorized into MSI Type Combined due to severe right-skew (skewness = 8.73).",
+           threeparttable = TRUE)
+ 
+# Apply log transformation
+df$mutation_count_log <- log(df$mutation_count + 1)
+ 
+# Combine rare MSI Type categories for modeling
+df$msi_type_combined <- dplyr::case_when(
+  df$msi_type == "Stable" ~ "Stable",
+  df$msi_type == "Instable" ~ "Instable",
+  TRUE ~ "Other"
+)
+ 
+df$msi_type_combined <- factor(df$msi_type_combined,
+                                levels = c("Stable", "Instable", "Other"))
+```
+
+First ,we will analysize the data distribution (Figure 3,Appendix A:Figure 1)and skewness.Skewness assessment(Table 1) revealed that mutation count was severely right-skewed (skewness = 8.13), and a log transformation was applied to address this prior to modelling(Figure 2). Fraction genome altered showed mild right skewness (skewness = 0.59) but was retained in its original form as the degree of skewness was not considered severe enough to warrant transformation. Tumour purity was approximately symmetric (skewness = 0.27) and required no transformation. MSI score was excluded from continuous analysis due to severe right skewness (skewness = 8.73) and   we analyzed the data using its categorical version (msi_type_combined) to avoid distributional issue. MSI Type Combined comprising three groups: Stable, Instable, and Other to analyze the data.
+
+```{r,include=FALSE}
+# Plot : Distribution of continuous predictors (before transformation)
+
+par(mfrow=c(2,2))
+
+hist(df$mutation_count, breaks=30, col="steelblue", border="white",
+     main="Mutation Count", xlab="Mutation Count", las=1)
+
+hist(df$fraction_genome_altered, breaks=30, col="coral", border="white",
+     main="Fraction Genome Altered", xlab="FGA", las=1)
+
+hist(df$msi_score, breaks=30, col="seagreen", border="white",
+     main="MSI Score", xlab="MSI Score", las=1)
+
+
+hist(df$tumor_purity, breaks=30, col="orange", border="white",
+     main="Tumor Purity", xlab="Purity (%)", las=1)
+
+# Add figure caption at the bottom
+mtext("Figure 1: Distribution of continuous predictors before transformation.", 
+      side=1, line=1, cex=0.9, adj=0.5, font=2,
+      outer=TRUE)   # ← outer=TRUE puts it outside all plots
+
+```
+
+```{r fig.width=5, fig.height=4, fig.align='center'}
+# Plot : Log-transformed distributions
+
+hist(df$mutation_count_log, breaks=30, col="steelblue", border="white",
+     main="Figure 2.Log-Transformed Mutation Count", 
+     xlab="log(Mutation Count + 1)", 
+     ylab="Frequency",
+     las=1,
+     xlim=c(0, 4.5),
+     ylim=c(0, 1000),
+     xaxs="i",
+     yaxs="i",
+     xaxt="n")  # ← suppress default x axis
+
+# Add custom x axis with more precise breaks
+axis(1, at=seq(0, 4.5, by=0.5))  # ← marks at 0, 0.5, 1.0, 1.5...
+
+box(bty="l")
+
+```
+
+```{r}
+#  Create Analysis-Ready Datasets
+
+# Dataset : For Research Question (Survival prediction)
+
+df_survival <- df %>%
+  select(survival_binary, 
+         mutation_count, mutation_count_log,
+         fraction_genome_altered, 
+         msi_type_combined,
+         sample_type, is_metastatic,
+         cancer_type_simple,
+         tumor_purity) %>%
+  filter(complete.cases(.))
+
+```
+
+
+```{r}
+# Complete dataset with all variables
+
+df_complete <- df %>%
+  filter(!is.na(survival_binary),
+         !is.na(mutation_count_log),
+         !is.na(fraction_genome_altered),
+         !is.na(tumor_purity),
+         !is.na(msi_type_combined))
+
+```
+In summary,after the process of variables selection ,missing data deletion, distribution and skewnenss, we will obtain the necessary information in Table 2:
+```{r}
+var_summary <- data.frame(
+  Variable = c("Overall Survival Status",
+               "Log Mutation Count",
+               "Fraction Genome Altered",
+               "Tumor Purity",
+               "MSI Type Combined",
+               "Metastatic Status",
+               "Cancer Type"),
+  Type = c("Binary",
+           "Continuous",
+           "Continuous",
+           "Continuous",
+           "Categorical",
+           "Binary",
+           "Categorical"),
+  Role = c("Outcome",
+           "Primary Predictor",
+           "Primary Predictor",
+           "Confounder",
+           "Primary Predictor",
+           "Primary Predictor",
+           "Confounder"),
+  Details = c("Deceased (1) / Living (0)",
+              "log(Mutation Count + 1)",
+              "Range: 0 to 1",
+              "Range: 10% to 100%",
+              "Stable / Instable / Other",
+              "Metastatic (1) / Primary (0)",
+              "Invasive Ductal / Lobular / Mixed / Other")
+)
+
+kable(var_summary,
+      col.names = c("Variable", "Type", "Role", "Details"),
+      align = c("l", "c", "c", "l"),
+      caption = "Summary of Variables Used in Analysis",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#e8f4f8") %>%  # highlight outcome
+  column_spec(1, bold = TRUE)
+```
+
+
+```{r,include=FALSE}
+# Outcome Variable Distributions
+table_survival <- table(df$overall_survival_status)
+print(table_survival)
+prop_survival <- prop.table(table_survival) * 100
+
+table_sample <- table(df$sample_type)
+print(table_sample)
+prop_sample <- prop.table(table_sample) * 100
+
+# Predictor Variable Distributions
+print(summary(df$mutation_count_log))          
+print(summary(df$fraction_genome_altered))
+print(summary(df$tumor_purity))         
+
+# MSI Type Combined distribution
+table_msi <- table(df$msi_type_combined)
+prop_msi <- prop.table(table_msi) * 100
+cat("\nMSI Type Distribution:\n")
+print(cbind(
+  Count = table_msi,
+  Percentage = round(prop_msi, 2)
+))
+
+```
+
+
+```{r}
+par(mfrow=c(2,2), oma=c(3,0,0,0))
+
+boxplot(mutation_count_log ~ survival_binary, data=df_complete,
+        col=c("lightgreen", "lightcoral"),
+        names=c("Living", "Deceased"),
+        main="Log Mutation Count by Survival Status",
+        ylab="Mutation Count", las=1)
+
+boxplot(fraction_genome_altered ~ survival_binary, data=df_complete,
+        col=c("lightgreen", "lightcoral"),
+        names=c("Living", "Deceased"),
+        main="FGA by Survival Status",
+        ylab="Fraction Genome Altered", las=1)
+
+boxplot(tumor_purity ~ survival_binary, data=df_complete,
+        col=c("lightgreen", "lightcoral"),
+        names=c("Living", "Deceased"),
+        main="Tumor Purity by Survival Status",
+        ylab="Tumor Purity (%)", las=1)
+
+# barplot for MSI Type
+msi_surv_table <- table(df_complete$msi_type_combined, 
+                         df_complete$survival_binary)
+
+bp <- barplot(prop.table(msi_surv_table, margin=1) * 100,
+        beside=TRUE,
+        col=c("lightgreen", "lightcoral", "lightyellow"),
+        names.arg=c("Living", "Deceased"),
+        main="MSI Type by Survival Status",
+        ylab="Percentage (%)", 
+        las=1,
+        legend=FALSE,
+        xlim=c(0, 12)) 
+
+legend(x=10, y=70,     
+       legend=c("Stable", "Instable", "Other"),
+       fill=c("lightgreen", "lightcoral", "lightyellow"),
+       cex=0.7,
+       xpd=TRUE)
+mtext("Figure 3: Distribution of predictors by survival status (Living vs Deceased).",
+      side=1, line=1, cex=0.9, adj=0.5, font=2, outer=TRUE)
+```
+
+## 4.2 Correlation Analysis
+
+```{r,include=TRUE}
+# Correlation Analysis
+cor_vars <- df_complete %>%
+  select(mutation_count_log,            
+         fraction_genome_altered, 
+         tumor_purity) %>%          
+  na.omit()
+
+cor_matrix <- cor(cor_vars)
+
+# Convert to table format
+cor_table <- as.data.frame(round(cor_matrix, 3))
+rownames(cor_table) <- c("Log Mutation Count", 
+                          "Fraction Genome Altered", 
+                          "Tumor Purity")
+colnames(cor_table) <- c("Log Mutation Count", 
+                          "Fraction Genome Altered", 
+                          "Tumor Purity")
+
+kable(cor_table,
+      caption = "Correlation Matrix of Continuous Predictors",
+      align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  footnote(general = "All correlations |r| < 0.5. No multicollinearity concerns.")
+
+# Check for high correlations - result shown in footnote above
+high_cor <- which(abs(cor_matrix) > 0.7 & cor_matrix != 1, arr.ind = TRUE)
+if(nrow(high_cor) > 0) {
+  for(i in 1:nrow(high_cor)) {
+    var1 <- rownames(cor_matrix)[high_cor[i,1]]
+    var2 <- colnames(cor_matrix)[high_cor[i,2]]
+    r_val <- cor_matrix[high_cor[i,1], high_cor[i,2]]
+    cat(sprintf("High correlation: %s ~ %s = %.3f\n", var1, var2, r_val))
+  }
+}
+
+
+```
+
+```{r,include=FALSE}
+# Plot 4: Correlation matrix
+library(corrplot)
+corrplot(cor_matrix, method="color", type="upper", 
+         tl.col="black", tl.srt=45,
+         addCoef.col = "black", number.cex=0.7,
+         col=colorRampPalette(c("blue", "white", "red"))(200),
+         title="Fig 4 Correlation Matrix of Continuous Predictors",
+         mar=c(0,0,2,0))
+```
+The correlation matrix revealed weak associations among all continuous predictors(Appendix A: Figure 4). Log mutation count and fraction genome altered showed a weak positive correlation (r = 0.116), while tumour purity and fraction genome altered showed a moderate positive correlation (r = 0.364). Log mutation count and tumour purity were negligibly correlated (r = 0.065). All correlations were below the threshold of |r| = 0.5, indicating no multicollinearity concerns among the continuous predictors.
+
+```{r,include=FALSE}
+# Bivariate Relationships
+
+# Mutation count by survival status
+
+tapply(df_complete$mutation_count_log, df_complete$survival_binary, summary)
+
+# T-test
+t_test_mut <- t.test(mutation_count_log ~ survival_binary, data = df_complete)
+
+t_test_mut
+
+# Fraction Genome Altered by survival status
+
+tapply(df_complete$fraction_genome_altered, df_complete$survival_binary, summary)
+
+t_test_fga <- t.test(fraction_genome_altered ~ survival_binary, data = df_complete)
+
+# print FGA t-test
+t_test_fga
+```
+Bivariate analysis revealed that both log-transformed mutation count and FGA differed significantly between surviving and deceased patients. Log-transformed mutation count was significantly higher in deceased patients (Mean = 1.82) compared to living patients (Mean = 1.66),p < 0.001), indicating that higher mutational burden is associated with worse survival outcomes. Similarly, FGA was significantly higher in deceased patients (Mean = 0.31) compared to living patients (Mean = 0.24, p < 0.001) confirming that greater chromosomal instability is strongly associated with mortality. These bivariate findings support the inclusion of both variables as primary predictors in the GLM model.
+
+```{r,include=FALSE}
+# Categorical Associations
+
+# Cancer type by survival
+table_cancer_surv <- table(df_complete$cancer_type_simple, df_complete$survival_binary)
+print(table_cancer_surv)
+print(prop.table(table_cancer_surv, margin=1) * 100)
+
+fisher_cancer <- fisher.test(table_cancer_surv)
+fisher_cancer
+
+chisq_cancer <- chisq.test(table_cancer_surv)
+chisq_cancer
+
+
+```
+The association between cancer type and survival status was statistically significant (p < 0.001). Among cancer subtypes, Other type had the highest mortality rate (64.8% deceased), followed by Invasive Lobular Carcinoma (57.5%) and Invasive Ductal Carcinoma (51.3%). Mixed type had the lowest mortality rate (25.0%), though this should be interpreted with caution given the very small sample size (n = 8). These findings suggest that cancer subtype is significantly associated with survival outcome and supports its inclusion as a confounder in the model.
+
+```{r,include=FALSE}
+# Sample type by survival
+
+table_sample_surv <- table(df_complete$sample_type, df_complete$survival_binary)
+print(table_sample_surv)
+print(prop.table(table_sample_surv, margin=1) * 100)
+
+chisq_sample <- chisq.test(table_sample_surv[c("Primary", "Metastasis"),])
+chisq_sample 
+```
+The association between sample type and survival status(Appendix A:Figure 5) was highly significant (p < 0.001). Metastatic tumours had a substantially higher mortality rate (73.4% deceased) compared to primary tumours (34.9% deceased), confirming that metastatic status is the strongest clinical predictor of survival in this dataset. Local Recurrence (40.0% deceased) and Unknown (50.0% deceased) categories had very small sample sizes (n = 11 and n = 6 respectively) and were therefore grouped with primary tumours as the non-metastatic reference category in the model. These findings strongly support the inclusion of metastatic status as a key predictor in the logistic regression model.
+
+```{r,include=FALSE}
+# Plot 5: Survival by Sample Type
+library(ggplot2)
+sample_surv_df <- as.data.frame(table_sample_surv)
+colnames(sample_surv_df) <- c("Sample_Type", "Survival", "Count")
+
+ggplot(sample_surv_df, aes(x=Sample_Type, y=Count, fill=factor(Survival))) +
+  geom_bar(stat="identity", position="dodge") +
+  scale_fill_manual(values=c("0"="lightgreen", "1"="lightcoral"),
+                    labels=c("Living", "Deceased"),
+                    name="Survival Status") +
+  labs(title="Fig 5 Survival Status by Sample Type",
+       x="Sample Type", y="Count") +
+  theme_minimal() +
+  theme(text=element_text(size=12))
+
+```
+
+```{r,include=FALSE}
+par(mfrow=c(1,2))
+
+# Log Mutation count vs FGA
+plot(df_complete$mutation_count_log, df_complete$fraction_genome_altered,
+     pch=16, col=rgb(0,0,1,0.3),
+     xlab="log(Mutation Count + 1)", ylab="Fraction Genome Altered",
+     main="Log Mutation Count vs FGA")
+abline(lm(fraction_genome_altered ~ mutation_count_log, data=df_complete), 
+       col="red", lwd=2)
+
+# Tumor purity vs Log Mutation count
+plot(df_complete$tumor_purity, df_complete$mutation_count_log,
+     pch=16, col=rgb(0.5,0,0.5,0.3),
+     xlab="Tumor Purity (%)", ylab="log(Mutation Count + 1)",
+     main="Tumor Purity vs Log MC")  # ← shortened title
+abline(lm(mutation_count_log ~ tumor_purity, data=df_complete),
+       col="darkgreen", lwd=2)
+```
+Scatter plots(Appendix A:Figure 6) confirm the weak positive relationship between log mutation count and FGA (r = 0.12), and the negligible relationship between tumor purity and log mutation count (r = 0.06), consistent with the correlation matrix results. No strong linear relationships were detected among continuous predictors.
+
+# 5 Fit the model
+
+## 5.1 Research Hypothesis
+
+H₀: Genomic instability markers (mutation count, FGA, and MSI type) are not significantly associated with overall survival status in breast cancer patients.
+
+H₁: At least one genomic instability marker is significantly associated with overall survival status in breast cancer patients.
+
+A significance level of $ α = 0.05$ was adopted for all statistical tests.
+
+## 5.2 Fit the model
+
+Model 1 was fitted as the baseline main effects model, including all six predictors: log-transformed mutation count, fraction genome altered, MSI type combined, metastatic status, cancer type, and tumour purity, with no interaction terms.
+
+The model produced an AIC of 4296.5. However, the Hosmer-Lemeshow goodness-of-fit test indicated poor calibration (p = 0.010), suggesting that the model did not adequately fit the observed data. Although the individual predictors showed expected directions of association, the failure of the calibration test indicated that the model was misspecified and that important relationships between predictors may not have been fully captured by the main effects alone.
+
+To address this, an interaction term was considered for Model 2. The interaction between mutation count and metastatic status was first explored, based on a statistical rationale — as metastatic status was the strongest predictor and mutation count was the weakest, examining their interaction would determine whether the effect of mutational burden on survival differed between primary and metastatic tumours.
+```{r,include=FALSE}
+model1_adjusted <- glm(survival_binary ~ 
+                         mutation_count_log + 
+                         fraction_genome_altered + 
+                         msi_type_combined +
+                         is_metastatic +
+                         cancer_type_simple +
+                         tumor_purity,
+                       data = df_survival,
+                       family = binomial(link = "logit"))
+summary(model1_adjusted)
+```
+
+```{r,include=FALSE}
+# Calculate odds ratios and 95% CI
+or_adj <- exp(coef(model1_adjusted))
+or_ci_adj <- exp(confint(model1_adjusted))
+
+results_adj <- data.frame(
+  Predictor = names(coef(model1_adjusted)),
+  Coefficient = coef(model1_adjusted),
+  OR = or_adj,
+  OR_Lower = or_ci_adj[,1],
+  OR_Upper = or_ci_adj[,2],
+  P_value = summary(model1_adjusted)$coefficients[,4]
+)
+
+```
+
+```{r,include=FALSE}
+# Extract key genomic predictors
+genomic_preds <- results_adj[grepl("mutation|fraction|msi_type", 
+                                   results_adj$Predictor, 
+                                   ignore.case=TRUE), ]
+
+for(i in 1:nrow(genomic_preds)) {
+  pred <- genomic_preds$Predictor[i]
+  or_val <- genomic_preds$OR[i]
+  ci_lower <- genomic_preds$OR_Lower[i]
+  ci_upper <- genomic_preds$OR_Upper[i]
+  p_val <- genomic_preds$P_value[i]
+  
+  cat(sprintf("\n%d. %s\n", i, pred))
+  cat(sprintf("   OR = %.3f (95%% CI: %.3f - %.3f), p = %s\n", 
+              or_val, ci_lower, ci_upper, format.pval(p_val, digits=3)))
+  
+  if(p_val < 0.05) {
+    if(grepl("mutation", pred)) {
+      cat("   ✓ SIGNIFICANT: Higher mutation burden predicts increased mortality\n")
+      cat("   → After adjusting for metastatic status, cancer type, and tumor purity,\n")
+      cat("     each unit increase in log(mutation count) increases odds of death by",
+          round((or_val-1)*100, 1), "%\n")
+    } else if(grepl("fraction", pred)) {
+      cat("   ✓ SIGNIFICANT: Greater genomic instability predicts worse survival\n")
+      cat("   → Each 0.1 increase in FGA increases odds of death by",
+          round((or_val^0.1-1)*100, 1), "%\n")
+    } else if(grepl("msi_type", pred)) {
+      cat("   ✓ SIGNIFICANT: MSI type category is independently predictive\n")
+    }
+  } else {
+    cat("   ✗ NOT SIGNIFICANT after adjusting for confounders\n")
+  }
+}
+```
+
+```{r,include=FALSE}
+# Multicollinearity (VIF)
+
+vif_values <- vif(model1_adjusted)
+vif_values
+
+```
+
+```{r,include=FALSE}
+# Goodness of Fit (Hosmer-Lemeshow Test)
+
+hl_test <- hoslem.test(model1_adjusted$y, fitted(model1_adjusted), g=10)
+hl_test
+
+
+```
+
+```{r,include=FALSE}
+model2_interaction <- glm(survival_binary ~ 
+                            mutation_count_log * is_metastatic +  # interaction
+                            fraction_genome_altered + 
+                            msi_type_combined +
+                            cancer_type_simple +
+                            tumor_purity,
+                          data = df_survival,
+                          family = binomial(link = "logit"))
+summary(model2_interaction)
+```
+```{r,include=FALSE}
+# AIC comparison
+AIC(model1_adjusted, model2_interaction)
+
+# Likelihood ratio test
+anova(model1_adjusted, model2_interaction, test = "Chisq")
+```
+
+```{r,include=FALSE}
+hl_test2 <- hoslem.test(model2_interaction$y, 
+                         fitted(model2_interaction), g = 10)
+hl_test2
+```
+ 
+Following the non-significant result of the first interaction (p = 0.612, AIC increased from 4296 to 4298),We know the second model2 is not appropriate neither. A second interaction was investigated between Fraction Genome Altered and metastatic status. 
+
+FGA was the strongest genomic predictor in the model (β = 1.691, p = 4.16e-14), Metastatic status remained the strongest clinical predictor (β = 1.569, p < 2e-16). The biological justification for their interaction is that chromosomal instability carries fundamentally different prognostic meaning depending on disease stage.Therefore, we have the third model model3.
+
+```{r,include=FALSE}
+model3_interaction <- glm(survival_binary ~ 
+                            mutation_count_log +
+                            fraction_genome_altered * is_metastatic +  # new interaction
+                            msi_type_combined +
+                            cancer_type_simple +
+                            tumor_purity,
+                          data = df_survival,
+                          family = binomial(link = "logit"))
+summary(model3_interaction)
+
+```
+
+```{r}
+# Compare to model1
+
+aic_table_clean <- data.frame(
+  Model = c("Model 1", "Model 2", "Model 3"),
+  Description = c(
+    "Main effects only",
+    "Main effects + MC x Meta",
+    "Main effects + FGA x Meta"),
+  AIC = c(round(AIC(model1_adjusted), 2),
+          round(AIC(model2_interaction), 2),
+          round(AIC(model3_interaction), 2)),
+  Delta_AIC = c(0.00, 1.74, -4.37),
+  HL_pvalue = c("0.006", "0.010", "0.269"),
+  Selected = c("", "", "Yes")
+)
+
+kable(aic_table_clean,
+      col.names = c("Model", "Description", 
+                    "AIC", "Delta AIC", "HL p-value", "Selected"),
+      align = c("l","l","c","c","c","c"),
+      caption = "Model Comparison and Selection",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(3, bold = TRUE, background = "#e8f5e9")
+```
+Three models were compared using the AIC. The main effects model (Model 1) served as the baseline. Adding the interaction between mutation count and metastatic status (Model 2) increased AIC by 1.74, indicating no improvement in model fit, and the interaction term was non-significant (p = 0.612). The interaction between FGA and metastatic status (Model 3) reduced AIC by 4.37 points, representing a meaningful improvement. This was further confirmed by a likelihood ratio test ( p = 0.012) and a passing Hosmer-Lemeshow test (p = 0.269). Model 3 was therefore selected as the final model. the model can be see like this and its interpretation:
+
+```{r,include=FALSE}
+# Print which model is best
+cat(sprintf("\n✓ Best model: Model 3 (lowest AIC = %.3f)\n", 
+            AIC(model3_interaction)))
+cat(sprintf("  Model 3 improves AIC by %.3f over Model 1\n",
+            AIC(model1_adjusted) - AIC(model3_interaction)))
+
+```
+
+
+```{r,include=FALSE}
+#LRT confirming model3 is better than model1
+
+anova(model1_adjusted, model3_interaction, test = "Chisq")
+
+# HL test
+hl_test3 <- hoslem.test(model3_interaction$y, 
+                         fitted(model3_interaction), g = 10)
+hl_test3
+```
+```{r,include=FALSE}
+# Pseudo R-squared
+null_dev <- model3_interaction$null.deviance
+resid_dev <- model3_interaction$deviance
+mcfadden_r2 <- 1 - (resid_dev / null_dev)
+
+# Cox-Snell R-squared
+n <- nrow(df_survival)
+cox_snell_r2 <- 1 - exp((resid_dev - null_dev) / n)
+
+# Nagelkerke R-squared
+nagelkerke_r2 <- cox_snell_r2 / (1 - exp(-null_dev / n))
+
+# Clean table
+r2_table <- data.frame(
+  Measure = c("McFadden's R²", 
+              "Cox-Snell R²", 
+              "Nagelkerke R²"),
+  Value = c(round(mcfadden_r2, 4),
+            round(cox_snell_r2, 4),
+            round(nagelkerke_r2, 4)),
+  Interpretation = c(
+    "Acceptable if > 0.2",
+    "Conservative lower bound",
+    "Adjusted, comparable to linear R²")
+)
+
+kable(r2_table,
+      col.names = c("Measure", "Value", "Interpretation"),
+      align = c("l", "c", "l"),
+      caption = "Pseudo R-squared Statistics - Final Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE)
+```
+Three pseudo R-squared measures(Appendix A Table 8)were calculated to assess the proportion of variance explained by the final model. The results show the model's acceptable discrimination (AUC = 0.738) and good calibration (Hosmer-Lemeshow p = 0.269), which together indicate that the model performs.The final model details as follows(Table 7):
+```{r}
+or_adj3 <- exp(coef(model3_interaction))
+or_ci_adj3 <- exp(confint(model3_interaction))
+results_adj3 <- data.frame(
+  Predictor = c("Intercept",
+                "Log Mutation Count",
+                "Fraction Genome Altered",
+                "Metastatic Status",
+                "MSI Type: Instable",
+                "MSI Type: Other",
+                "Cancer Type: Invasive Lobular",
+                "Cancer Type: Mixed",
+                "Cancer Type: Other",
+                "Tumor Purity",
+                "FGA x Metastatic"),
+  Coefficient = round(coef(model3_interaction), 4),
+  OR = round(or_adj3, 4),
+  OR_Lower = round(or_ci_adj3[,1], 4),
+  OR_Upper = round(or_ci_adj3[,2], 4),
+  P_value = round(summary(model3_interaction)$coefficients[,4], 6)
+)
+
+rownames(results_adj3) <- NULL
+
+kable(results_adj3,
+      col.names = c("Predictor", "Coefficient", 
+                    "OR", "95% CI Lower", 
+                    "95% CI Upper", "P-value"),
+      align = c("l","c","c","c","c","c"),
+      caption = "Final Model Coefficients and Odds Ratios",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped","hover","bordered"),
+                full_width = FALSE) %>%
+  row_spec(which(results_adj3$P_value < 0.05), 
+           bold = TRUE, background = "#e8f5e9")
+```
+
+$$\begin{aligned}
+\log\left(\frac{p}{1-p}\right) = &\beta_0 + \beta_1\text{MutationCount}_{log} + \beta_2\text{FGA} + \beta_3\text{Metastatic} \\
+&+ \beta_4\text{MSIType} + \beta_5\text{CancerType} + \beta_6\text{TumorPurity} \\
+&+ \beta_7(\text{FGA} \times \text{Metastatic})
+\end{aligned}$$
+Interpretation:
+
+$\beta_0 = -1.458$
+— the intercept, representing the baseline log odds of death when all predictors are zero, corresponding to a primary tumour, MSI-Stable, Invasive Ductal subtype with zero FGA, log mutation count, and tumour purity
+
+$\beta_2 = 2.240$ — the change in log odds of death for each one unit increase in FGA in primary tumours, holding all other variables constant. This effect was highly significant (p < 0.001)
+
+$\beta_3 = 1.877$ — the increase in log odds of death for metastatic compared to primary tumours, holding all other variables constant. This was the strongest predictor in the model (p < 0.001)
+
+$\beta_{10} = -1.044$ — the interaction term between FGA and metastatic status. This significant negative coefficient (p = 0.008) indicates that the effect of FGA on survival is substantially attenuated in metastatic disease compared to primary tumours
+
+
+```{r fig.width=5, fig.height=4, fig.align='center' }
+# Interaction Plot - FGA x Metastatic Status
+fga_seq <- seq(min(df_survival$fraction_genome_altered),
+               max(df_survival$fraction_genome_altered), 
+               length.out = 100)
+
+newdata_primary <- data.frame(
+  fraction_genome_altered = fga_seq,
+  is_metastatic = 0,
+  mutation_count_log = mean(df_survival$mutation_count_log, na.rm=TRUE),
+  msi_type_combined = factor("Stable", 
+                             levels = c("Stable","Instable","Other")),
+  cancer_type_simple = "Invasive Ductal",
+  tumor_purity = mean(df_survival$tumor_purity, na.rm=TRUE)
+)
+
+newdata_meta <- data.frame(
+  fraction_genome_altered = fga_seq,
+  is_metastatic = 1,
+  mutation_count_log = mean(df_survival$mutation_count_log, na.rm=TRUE),
+  msi_type_combined = factor("Stable", 
+                             levels = c("Stable","Instable","Other")),
+  cancer_type_simple = "Invasive Ductal",
+  tumor_purity = mean(df_survival$tumor_purity, na.rm=TRUE)
+)
+
+pred_primary <- predict(model3_interaction, 
+                        newdata = newdata_primary, 
+                        type = "response")
+pred_meta <- predict(model3_interaction, 
+                     newdata = newdata_meta, 
+                     type = "response")
+
+par(oma=c(3,0,0,0))  # ← add this before plot
+
+plot(fga_seq, pred_primary, 
+     type = "l", col = "blue", lwd = 2,
+     ylim = c(0, 1),
+     xlab = "Fraction Genome Altered (FGA)",
+     ylab = "Predicted Probability of Death",
+     main = "Interaction Effect: FGA x Metastatic Status")
+lines(fga_seq, pred_meta, col = "red", lwd = 2)
+legend("topleft",
+       legend = c("Primary Tumor", "Metastatic Tumor"),
+       col = c("blue", "red"), lwd = 2)
+abline(h = 0.5, lty = 2, col = "gray")
+grid()
+
+mtext("Figure 7: Interaction effect of FGA and metastatic status",
+      side=1, line=1, cex=0.9, adj=0.5, font=2, outer=TRUE)
+```
+Figure 7 illustrates the interaction between FGA and metastatic status on predicted probability of death, holding all other predictors at their mean values. In primary tumors (blue), predicted mortality probability increases steeply with FGA, rising from 0.24 at FGA = 0 to 0.74 at FGA = 1.0, demonstrating that chromosomal instability is a strong prognostic signal in localized disease. 
+
+In metastatic tumors (red), the baseline mortality probability is already high (0.67 at FGA = 0) and increases only modestly with FGA (0.86 at FGA = 1.0), indicating that metastatic status itself dominates prognosis and attenuates the additional contribution of genomic instability. This pattern confirms the significant interaction term (OR = 0.36, p = 0.012) and supports the biological interpretation that FGA is most clinically meaningful as a prognostic marker in primary breast cancer
+
+# 6 Model Diagnostics
+```{r,include=FALSE}
+vif(model3_interaction)
+```
+Variance inflation factors were examined for the final model. All values were below 2.2, including the interaction term, indicating no harmful multicollinearity. The modest inflation observed in fraction_genome_altered, is_metastatic, and their interaction term is expected in models containing interaction terms, as main effects and their product necessarily share variance.
+
+
+```{r,include=FALSE}
+# Influential Observations
+
+# Cook's Distance
+cooks_d3 <- cooks.distance(model3_interaction)
+influential_threshold3 <- 4 / nrow(df_survival)
+
+n_influential3 <- sum(cooks_d3 > influential_threshold3)
+
+percentage3 <- round(100 * n_influential3 / nrow(df_survival), 2)
+
+plot(cooks_d3, type="h", 
+     main="Cook's Distance - Final Model",
+     ylab="Cook's Distance", xlab="Observation Index")
+abline(h=influential_threshold3, col="red", lty=2)
+```
+
+
+```{r,include=FALSE}
+
+par(mfrow=c(1,2))
+
+# Model Discrimination (ROC Curve)
+
+# Calculate predicted probabilities - Final Model
+pred_prob3 <- predict(model3_interaction, type = "response")
+
+# ROC curve
+roc_obj3 <- roc(df_survival$survival_binary, pred_prob3)
+auc_value3 <- auc(roc_obj3)
+
+
+if(auc_value3 > 0.8) {
+  cat("✓ EXCELLENT discrimination (AUC > 0.8)\n\n")
+} else if(auc_value3 > 0.7) {
+  cat("✓ ACCEPTABLE discrimination (AUC > 0.7)\n\n")
+} else if(auc_value3 > 0.6) {
+  cat("⚠ POOR discrimination (AUC 0.6-0.7)\n")
+  cat("SOLUTION: Consider adding more predictors or interaction terms\n\n")
+} else {
+  cat("⚠ VERY POOR discrimination (AUC < 0.6)\n")
+  cat("SOLUTION: Model may need major revision\n\n")
+}
+
+# Plot ROC curve
+plot(roc_obj3, main="ROC Curve - Final Model (FGA × Metastatic)",
+     col="blue", lwd=2, print.auc=TRUE, print.auc.y=0.4)
+abline(a=0, b=1, lty=2, col="gray")
+
+
+# Plot Calibration Plot − Final Model
+
+cal_data3 <- data.frame(
+  predicted = pred_prob3,
+  observed = df_survival$survival_binary
+)
+
+cal_data3$decile <- cut(cal_data3$predicted,
+                        breaks=quantile(cal_data3$predicted,
+                                       probs=seq(0,1,0.1)),
+                        include.lowest=TRUE, labels=1:10)
+
+cal_summary3 <- cal_data3 %>%
+  group_by(decile) %>%
+  summarise(mean_predicted = mean(predicted),
+            mean_observed = mean(observed),
+            n = n())
+
+plot(cal_summary3$mean_predicted, cal_summary3$mean_observed,
+     xlim=c(0,1), ylim=c(0,1), pch=19, col="blue", cex=1.5,
+     xlab="Predicted Probability", ylab="Observed Proportion",
+     main="Calibration Plot - Final Model")
+abline(a=0, b=1, lty=2, col="red", lwd=2)
+grid()
+
+```
+```{r}
+
+par(mfrow=c(1,2), mar=c(4,4,3,1), oma=c(3,0,0,0))  # ← add oma
+
+# ROC Curve - zoomed in
+plot(roc_obj3, 
+     main="ROC Curve - Final Model",
+     col="blue", lwd=2, 
+     print.auc=TRUE, 
+     print.auc.y=0.4,
+     print.auc.cex=0.8,
+     cex.main=0.9,
+     cex.axis=0.8,
+     cex.lab=0.8)
+abline(a=0, b=1, lty=2, col="gray")
+
+# Calibration Plot
+cal_data3 <- data.frame(
+  predicted = pred_prob3,
+  observed = df_survival$survival_binary
+)
+cal_data3$decile <- cut(cal_data3$predicted,
+                        breaks=quantile(cal_data3$predicted,
+                                       probs=seq(0,1,0.1)),
+                        include.lowest=TRUE, labels=1:10)
+cal_summary3 <- cal_data3 %>%
+  group_by(decile) %>%
+  summarise(mean_predicted = mean(predicted),
+            mean_observed = mean(observed),
+            n = n())
+plot(cal_summary3$mean_predicted, cal_summary3$mean_observed,
+     xlim=c(0,1), ylim=c(0,1), pch=19, col="blue", cex=1.2,
+     xlab="Predicted Probability", ylab="Observed Proportion",
+     main="Calibration Plot - Final Model",
+     cex.main=0.9,
+     cex.axis=0.8,
+     cex.lab=0.8)
+abline(a=0, b=1, lty=2, col="red", lwd=2)
+grid()
+
+# Add figure caption at bottom
+mtext("Figure 8: ROC curve (AUC = 0.741) and calibration plot for the final model.",
+      side=1, line=1, cex=0.9, adj=0.5, font=2, outer=TRUE)
+
+```
+
+
+The final model demonstrated acceptable discrimination with an AUC of 0.738(Figure 8), indicating that the model correctly distinguishes between deceased and surviving patients approximately 73.8% of the time. This is considered acceptable performance for a clinical prediction model using genomic markers alone, as survival outcomes in cancer are influenced by many additional factors beyond genomic instability, such as treatment history and comorbidities, which were not available in this dataset.
+
+
+```{r,  include=FALSE}
+cal_data3 <- data.frame(
+  predicted = pred_prob3,
+  observed = df_survival$survival_binary
+)
+
+cal_data3$decile <- cut(cal_data3$predicted,
+                        breaks=quantile(cal_data3$predicted,
+                                       probs=seq(0,1,0.1)),
+                        include.lowest=TRUE, labels=1:10)
+
+cal_summary3 <- cal_data3 %>%
+  group_by(decile) %>%
+  summarise(mean_predicted = mean(predicted),
+            mean_observed = mean(observed),
+            n = n())
+
+plot(cal_summary3$mean_predicted, cal_summary3$mean_observed,
+     xlim=c(0,1), ylim=c(0,1), pch=19, col="blue", cex=1.5,
+     xlab="Predicted Probability", ylab="Observed Proportion",
+     main="Calibration Plot - Final Model")
+abline(a=0, b=1, lty=2, col="red", lwd=2)
+grid()
+
+
+```
+The calibration plot(Figure 8) demonstrates that the final model is well-calibrated across the full range of predicted probabilities. The observed proportions of mortality closely follow the diagonal reference line across all deciles, indicating that the model neither systematically overestimates nor underestimates survival risk at any probability level. This is consistent with the passing Hosmer-Lemeshow test (p = 0.269), confirming that the addition of the FGA × metastatic status interaction term successfully resolved the calibration issues observed in the main effects model.
+
+Residual diagnostics(Figure 9) for the final model are consistent with the assumptions of logistic regression. The Residuals vs Fitted and Scale-Location plots display the characteristic two-band pattern inherent to binary outcome models, reflecting the discrete nature of the response variable rather than any model violation. The Q-Q plot shows good alignment along the reference line in the central region, with minor tail departures that are expected given the binary outcome distribution. Cook's distance confirmed that only 1.92% of observations exceeded the influence threshold (4/n), with no single observation exerting disproportionate leverage on the model estimates. Overall, the diagnostics support the adequacy of the final model.
+
+
+```{r }
+# 6. Residual Diagnostics
+
+dev_resid3 <- residuals(model3_interaction, type="deviance")
+par(mfrow=c(2,2), oma=c(3,0,0,0))  # ← add oma for bottom space
+
+plot(fitted(model3_interaction), dev_resid3,
+     main="Residuals vs Fitted", 
+     xlab="Fitted Values", ylab="Deviance Residuals",
+     pch=20, col=rgb(0,0,1,0.3))
+abline(h=0, col="red", lty=2)
+
+qqnorm(dev_resid3, main="Q-Q Plot", pch=20, col=rgb(0,0,1,0.3))
+qqline(dev_resid3, col="red", lwd=2)
+
+plot(fitted(model3_interaction), sqrt(abs(dev_resid3)),
+     main="Scale-Location",
+     xlab="Fitted Values", ylab="√|Deviance Residuals|",
+     pch=20, col=rgb(0,0,1,0.3))
+
+plot(cooks_d3, type="h",
+     main="Cook's Distance",
+     ylab="Cook's Distance", xlab="Observation Index")
+abline(h=influential_threshold3, col="red", lty=2)
+
+# Add figure caption at bottom
+mtext("Figure 9: Model diagnostic plots for the final model (FGA x Metastatic).",
+      side=1, line=1, cex=0.9, adj=0.5, font=2, outer=TRUE)
+
+```
+
+# 7 Conclusion
+
+This study applied binary logistic regression to examine how genomic instability markers predict overall survival in breast cancer patients. The final model, selected via AIC and Hosmer-Lemeshow testing, included an interaction between FGA and metastatic status. FGA was the strongest genomic predictor in primary tumours (p < 0.001), while its effect was significantly attenuated in metastatic disease (interaction OR = 0.36, p = 0.008), where metastatic status itself dominated prognosis (p < 0.001). Mutation count was not independently significant after adjustment (p = 0.244). These findings suggest that chromosomal instability, particularly FGA, is a clinically meaningful prognostic marker in primary breast cancer, with its prognostic value varying by disease stage.
+
+# 8 Limitation
+
+Two key limitations should be acknowledged. First, the binary overall survival status outcome discards potentially informative variation in survival time; patients who died early versus late in follow-up are treated identically, and a survival analysis approach such as Cox regression would better capture the time-dependent nature of mortality risk. Second, the dataset contains only genomic markers and basic clinical variables, excluding important prognostic factors such as treatment history, therapy lines received, comorbidities, and follow-up duration; this restricts both the interpretability and generalizability of the findings, and likely explains the model's moderate discrimination of AUC = 0.738.
+
+\newpage
+
+# Appendix A: Additional Figures
+
+## Figure 1:  Distribution of continuous predictors (before transformation)
+```{r}
+# Plot : Distribution of continuous predictors (before transformation)
+
+par(mfrow=c(2,2))
+
+hist(df$mutation_count, breaks=30, col="steelblue", border="white",
+     main="Mutation Count", xlab="Mutation Count", las=1)
+
+hist(df$fraction_genome_altered, breaks=30, col="coral", border="white",
+     main="Fraction Genome Altered", xlab="FGA", las=1)
+
+hist(df$msi_score, breaks=30, col="seagreen", border="white",
+     main="MSI Score", xlab="MSI Score", las=1)
+
+
+hist(df$tumor_purity, breaks=30, col="orange", border="white",
+     main="Tumor Purity", xlab="Purity (%)", las=1)
+
+# Add figure caption at the bottom
+mtext("Figure 1: Distribution of continuous predictors before transformation.", 
+      side=1, line=1, cex=0.9, adj=0.5, font=2,
+      outer=TRUE)   # ← outer=TRUE puts it outside all plots
+```
+
+
+## Figure 4: Correlation Matrix Heatmap
+
+```{r fig.width=8, fig.height=6}
+
+# Correlation matrix
+
+library(corrplot)
+corrplot(cor_matrix, method="color", type="upper", 
+         tl.col="black", tl.srt=45,
+         addCoef.col = "black", number.cex=0.7,
+         col=colorRampPalette(c("blue", "white", "red"))(200),
+         title="Correlation Matrix of Continuous Predictors",
+         mar=c(0,0,2,0))
+```
+
+## Figure 5: Survival Status by Sample Type
+
+```{r}
+library(ggplot2)
+sample_surv_df <- as.data.frame(table_sample_surv)
+colnames(sample_surv_df) <- c("Sample_Type", "Survival", "Count")
+
+ggplot(sample_surv_df, aes(x=Sample_Type, y=Count, fill=factor(Survival))) +
+  geom_bar(stat="identity", position="dodge") +
+  scale_fill_manual(values=c("0"="lightgreen", "1"="lightcoral"),
+                    labels=c("Living", "Deceased"),
+                    name="Survival Status") +
+  labs(title="Survival Status by Sample Type",
+       x="Sample Type", y="Count") +
+  theme_minimal() +
+  theme(text=element_text(size=12))
+
+```
+
+## Figure 6: Scatter plots
+```{r}
+par(mfrow=c(1,2), oma=c(3,0,0,0)) 
+# Log Mutation count vs FGA
+plot(df_complete$mutation_count_log, df_complete$fraction_genome_altered,
+     pch=16, col=rgb(0,0,1,0.3),
+     xlab="log(Mutation Count + 1)", ylab="Fraction Genome Altered",
+     main="Log Mutation Count vs FGA")
+abline(lm(fraction_genome_altered ~ mutation_count_log, data=df_complete), 
+       col="red", lwd=2)
+
+# Tumor purity vs Log Mutation count
+plot(df_complete$tumor_purity, df_complete$mutation_count_log,
+     pch=16, col=rgb(0.5,0,0.5,0.3),
+     xlab="Tumor Purity (%)", ylab="log(Mutation Count + 1)",
+     main="Tumor Purity vs Log MC")  # ← shortened title
+abline(lm(mutation_count_log ~ tumor_purity, data=df_complete),
+       col="darkgreen", lwd=2)
+# Add figure caption at bottom
+mtext("Figure 6: Scatter plots of continuous predictors showing weak linear relationships.",
+      side=1, line=1, cex=0.9, adj=0.5, font=2, outer=TRUE)
+```
+
+
+## Table 6: Missing Data
+```{r}
+# Missing data assessment
+missing_summary <- data.frame(
+  Variable = names(df),
+  Missing_Count = sapply(df, function(x) sum(is.na(x))),
+  Missing_Percent = round(sapply(df, function(x) 100 * sum(is.na(x)) / length(x)), 2)
+) %>%
+  arrange(desc(Missing_Count))
+
+rownames(missing_summary) <- NULL
+
+kable(missing_summary,
+      col.names = c("Variable", "Missing Count", "Missing (%)"),
+      align = c("l", "c", "c"),
+      caption = "Missing Data Assessment",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE,
+                latex_options = "hold_position") %>%
+  row_spec(which(missing_summary$Missing_Percent > 0),
+           background = "#fff3e0") %>%
+  footnote(general = "All variables have less than 3% missing data. Listwise deletion applied.",
+           threeparttable = TRUE)
+
+# Variables with >10% missing
+high_missing <- missing_summary$Variable[missing_summary$Missing_Percent > 10]
+```
+
+
+
+## Table 7: Outliers
+
+```{r}
+# Function to detect outliers using IQR method
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 3 * IQR
+  upper <- Q3 + 3 * IQR
+  outliers <- x < lower | x > upper
+  return(sum(outliers, na.rm = TRUE))
+}
+
+continuous_vars <- c("mutation_count", 
+                     "msi_score",
+                     "fraction_genome_altered", 
+                     "tumor_purity")
+
+outlier_counts <- data.frame(
+  Variable = c("Mutation Count", 
+               "MSI Score",
+               "Fraction Genome Altered", 
+               "Tumor Purity"),
+  N_Outliers = sapply(df[continuous_vars], detect_outliers),
+  Percent = round(100 * sapply(df[continuous_vars], 
+                               detect_outliers) / nrow(df), 2)
+)
+
+rownames(outlier_counts) <- NULL
+
+kable(outlier_counts,
+      col.names = c("Variable", "N Outliers", "Percentage (%)"),
+      align = c("l", "c", "c"),
+      caption = "Outlier Detection Using 3xIQR Method",  # ← changed × to x
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(which(outlier_counts$Percent > 0),
+           bold = TRUE, background = "#fff3e0")
+```
+## Table 8: Pseudo R_square
+
+```{r}
+# Pseudo R-squared
+null_dev <- model3_interaction$null.deviance
+resid_dev <- model3_interaction$deviance
+mcfadden_r2 <- 1 - (resid_dev / null_dev)
+
+# Cox-Snell R-squared
+n <- nrow(df_survival)
+cox_snell_r2 <- 1 - exp((resid_dev - null_dev) / n)
+
+# Nagelkerke R-squared
+nagelkerke_r2 <- cox_snell_r2 / (1 - exp(-null_dev / n))
+
+# Clean table
+r2_table <- data.frame(
+  Measure = c("McFadden's R²", 
+              "Cox-Snell R²", 
+              "Nagelkerke R²"),
+  Value = c(round(mcfadden_r2, 4),
+            round(cox_snell_r2, 4),
+            round(nagelkerke_r2, 4)),
+  Interpretation = c(
+    "Acceptable if > 0.2",
+    "Conservative lower bound",
+    "Adjusted, comparable to linear R²")
+)
+
+kable(r2_table,
+      col.names = c("Measure", "Value", "Interpretation"),
+      align = c("l", "c", "l"),
+      caption = "Pseudo R-squared Statistics - Final Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE)
+```
+
+\newpage
+
+# Appendix B: Reference
+
+1.Gupta, A., Gazzo, A., Selenica, P., Safonov, A., Pareja, F., da Silva, E. M., & Chandarlapaty, S. (2025). APOBEC3 mutagenesis drives therapy resistance in breast cancer. Nature Genetics, 57, 1452–1462
+
+2.Samstein, R. M., Lee, C. H., Shoushtari, A. N., Hellmann, M. D., Shen, R., Janjigian, Y. Y., & Morris, L. G. (2019). Tumor mutational burden predicts survival after immunotherapy across multiple cancer types. Nature Genetics, 51(2), 202–206.
+
+3.Hieronymus, H., Murali, R., Tin, A., Yadav, K., Abida, W., Bustamante, C., & Sawyers, C. L. (2018). Tumor copy number alteration burden is a pan-cancer prognostic factor associated with recurrence and death. eLife, 7, e37294.
+
+4.Aran, D., Sirota, M., & Butte, A. J. (2015). Systematic pan-cancer analysis of tumour purity. Nature Communications, 6, 8971.
+
+5.Makki, J. (2015). Diversity of breast carcinoma: Histological subtypes and clinical relevance. Clinical Medicine Insights: Pathology, 8, 23–31.
+
+6.Schafer, J. L. (1999). Multiple imputation: A primer. Statistical Methods in Medical Research, 8(1), 3–15.
+
+
+\newpage
+
+# Appendix C: Full R Code
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+
+```
+
